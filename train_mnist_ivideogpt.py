@@ -27,6 +27,7 @@ import math
 import os
 from pathlib import Path
 import sys
+import gc
 
 import torch
 import torch.nn.functional as F
@@ -315,38 +316,17 @@ def tokenize_video(vq_model, pixel_values, context_length):
         context_length: Number of context frames
     
     Returns:
-        tokens: Tokenized sequence
+        input_ids: Tokenized input sequence
         labels: Target labels for prediction
     """
-    device = pixel_values.device
-    batch_size, seq_len, channels, height, width = pixel_values.shape
-    
-    # Encode all frames
-    # Reshape to (B*T, C, H, W) for encoding
-    flat_frames = pixel_values.view(-1, channels, height, width)
+    # The CompressiveVQModel.tokenize() method handles everything:
+    # - Encodes context frames separately
+    # - Encodes future frames conditioned on context
+    # - Quantizes to discrete tokens
+    # - Returns properly formatted indices and labels
     
     with torch.no_grad():
-        # Encode to discrete tokens
-        _, _, token_indices = vq_model.encode(flat_frames)
-        # token_indices shape: (B*T, num_tokens_per_frame)
-    
-    # Reshape back to (B, T, num_tokens_per_frame)
-    num_tokens_per_frame = token_indices.shape[1]
-    token_indices = token_indices.view(batch_size, seq_len, num_tokens_per_frame)
-    
-    # Flatten to sequence: (B, T * num_tokens_per_frame)
-    token_sequence = token_indices.view(batch_size, -1)
-    
-    # Create input/target pairs
-    # Input: context frames + all but last token
-    # Target: all but first context_length frames
-    context_tokens = context_length * num_tokens_per_frame
-    input_ids = token_sequence[:, :-1]  # All but last token
-    labels = token_sequence[:, context_tokens:].clone()  # Predict after context
-    
-    # Mask context tokens in labels (don't compute loss on them)
-    if context_tokens > 0:
-        labels = F.pad(labels, (context_tokens - 1, 0), value=-100)
+        input_ids, labels = vq_model.tokenize(pixel_values, context_length=context_length)
     
     return input_ids, labels
 
@@ -413,38 +393,31 @@ def generate_predictions(model, vq_model, eval_dataloader, accelerator, args, gl
     batch_size, seq_len, channels, height, width = pixel_values.shape
     
     with torch.no_grad():
-        # Use context frames
+        # Get the full sequence tokens for visualization
+        full_input_ids, full_labels = tokenize_video(vq_model, pixel_values, context_length=args.context_length)
+        
+        # For generation: tokenize just the context frames
         context_frames = pixel_values[:, :args.context_length]
+        context_input_ids, _ = tokenize_video(vq_model, context_frames, context_length=args.context_length)
         
-        # Tokenize context
-        input_ids, _ = tokenize_video(vq_model, context_frames, context_length=0)
+        # Calculate how many tokens to generate for future frames
+        # Each frame generates tokens, we need tokens for (seq_len - context_length) frames
+        tokens_per_full_seq = full_input_ids.shape[1]
+        tokens_to_generate = tokens_per_full_seq - context_input_ids.shape[1]
         
-        # Generate tokens for remaining frames
-        num_tokens_per_frame = input_ids.shape[1] // args.context_length
-        num_predict_tokens = (seq_len - args.context_length) * num_tokens_per_frame
-        
+        # Generate future tokens
         generated_ids = model.generate(
-            input_ids,
-            max_new_tokens=num_predict_tokens,
+            context_input_ids,
+            max_new_tokens=tokens_to_generate,
             do_sample=True,
             temperature=1.0,
             top_k=100,
             pad_token_id=0
         )
         
-        # Decode generated tokens back to frames
-        # Reshape to (B, T, num_tokens_per_frame)
-        all_tokens = generated_ids[:, :seq_len * num_tokens_per_frame]
-        all_tokens = all_tokens.view(batch_size, seq_len, num_tokens_per_frame)
-        
-        # Decode frame by frame
-        predicted_frames = []
-        for t in range(seq_len):
-            frame_tokens = all_tokens[:, t]  # (B, num_tokens_per_frame)
-            decoded_frame = vq_model.decode_tokens(frame_tokens)
-            predicted_frames.append(decoded_frame)
-        
-        predicted_video = torch.stack(predicted_frames, dim=1)  # (B, T, C, H, W)
+        # Detokenize to get video frames
+        # The detokenize method expects indices without the first dummy token
+        predicted_video = vq_model.detokenize(generated_ids, context_length=args.context_length)
     
     # Save samples
     sample_dir = Path(args.output_dir) / "samples" / f"step_{global_step}"
@@ -504,8 +477,26 @@ def main():
     accelerator.wait_for_everyone()
     
     # ===== 1. Load VQ-VAE Tokenizer =====
+    # Tokenizer is in a subfolder - use subfolder parameter for HuggingFace
+    # or append /tokenizer for local paths
     logger.info(f"Loading VQ-VAE tokenizer from {args.tokenizer_path}")
-    vq_model = CompressiveVQModel.from_pretrained(args.tokenizer_path)
+    
+    # Check if it's a local path or HuggingFace repo
+    if os.path.exists(args.tokenizer_path):
+        # Local path - check if tokenizer subfolder exists
+        tokenizer_path = args.tokenizer_path
+        if os.path.exists(os.path.join(tokenizer_path, 'tokenizer')):
+            tokenizer_path = os.path.join(tokenizer_path, 'tokenizer')
+        logger.info(f"  Loading from local path: {tokenizer_path}")
+        vq_model = CompressiveVQModel.from_pretrained(tokenizer_path)
+    else:
+        # HuggingFace repo - use subfolder parameter
+        logger.info(f"  Loading from HuggingFace with subfolder='tokenizer'")
+        vq_model = CompressiveVQModel.from_pretrained(
+            args.tokenizer_path,
+            subfolder='tokenizer'
+        )
+    
     vq_model.eval()  # Keep in eval mode (frozen)
     vq_model = vq_model.to(accelerator.device)
     
@@ -517,6 +508,11 @@ def main():
         logger.info(f"Initializing model from config: {args.model_config}")
         config = AutoConfig.from_pretrained(args.model_config)
         model = AutoModelForCausalLM.from_config(config)
+    
+    # Gradient checkpointing disabled - causes hanging issues
+    # if hasattr(model, 'gradient_checkpointing_enable'):
+    #     logger.info("Enabling gradient checkpointing to reduce memory usage")
+    #     model.gradient_checkpointing_enable()
     
     # Count parameters
     total_params = sum(p.numel() for p in model.parameters())
@@ -558,7 +554,7 @@ def main():
         batch_size=args.per_device_train_batch_size,
         shuffle=True,
         num_workers=args.dataloader_num_workers,
-        pin_memory=True,
+        pin_memory=False,  # Disabled - causes hanging with CPU training
         drop_last=True
     )
     
@@ -567,7 +563,7 @@ def main():
         batch_size=args.per_device_eval_batch_size,
         shuffle=False,
         num_workers=args.dataloader_num_workers,
-        pin_memory=True
+        pin_memory=False  # Disabled - causes hanging with CPU training
     )
     
     # ===== 5. Setup Optimizer and Scheduler =====
@@ -607,6 +603,7 @@ def main():
     
     # Only show progress bar on main process
     progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
+    print("[DEBUG] Progress bar created", flush=True)
     completed_steps = 0
     starting_epoch = 0
     
@@ -627,34 +624,208 @@ def main():
         metrics = evaluate_model(model, vq_model, eval_dataloader, accelerator, args, completed_steps)
         return
     
+    print("\n" + "="*80, flush=True)
+    print("[DEBUG] STARTING TRAINING LOOP", flush=True)
+    print("="*80 + "\n", flush=True)
+    logger.info("Starting training loop...")
+    sys.stdout.flush()
+    sys.stderr.flush()
+    
     model.train()
     
     for epoch in range(starting_epoch, args.num_train_epochs):
         total_loss = 0
         
+        logger.info(f"Starting epoch {epoch + 1}/{args.num_train_epochs}")
+        sys.stdout.flush()
+        sys.stderr.flush()
+        
         for step, batch in enumerate(train_dataloader):
-            # batch shape: (B, T, C, H, W)
-            pixel_values = batch
-            
-            # Tokenize video
-            with torch.no_grad():
-                input_ids, labels = tokenize_video(vq_model, pixel_values, args.context_length)
-            
-            # Forward pass
-            with accelerator.accumulate(model):
-                outputs = model(input_ids=input_ids, labels=labels)
-                loss = outputs.loss
+            try:
+                # batch shape: (B, T, C, H, W)
+                pixel_values = batch
                 
-                total_loss += loss.detach().float()
-                accelerator.backward(loss)
+                if step == 0 and epoch == starting_epoch:
+                    print(f"\n[DEBUG] First batch shape: {pixel_values.shape}", flush=True)
+                    print(f"[DEBUG] First batch device: {pixel_values.device}", flush=True)
+                    print(f"[DEBUG] First batch dtype: {pixel_values.dtype}", flush=True)
+                    print(f"[DEBUG] First batch value range: [{pixel_values.min():.3f}, {pixel_values.max():.3f}]", flush=True)
+                    logger.info(f"First batch shape: {pixel_values.shape}")
+                    sys.stdout.flush()
+                    sys.stderr.flush()
                 
-                # Clip gradients
-                if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                if step == 1 and epoch == starting_epoch:
+                    print(f"\n[DEBUG] SECOND ITERATION - Step {step}", flush=True)
+                    print(f"[DEBUG] Second batch shape: {pixel_values.shape}", flush=True)
+                    sys.stdout.flush()
                 
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad()
+                # Print progress every 10 steps after the first two
+                if step > 1 and step % 10 == 0:
+                    print(f"[DEBUG] Processing step {step}/{len(train_dataloader)}", flush=True)
+                    sys.stdout.flush()
+                
+                # Tokenize video
+                if step == 0 and epoch == starting_epoch:
+                    print("[DEBUG] Starting tokenization...", flush=True)
+                    logger.info("Starting tokenization...")
+                    sys.stdout.flush()
+                    sys.stderr.flush()
+                
+                if step == 1 and epoch == starting_epoch:
+                    print("[DEBUG] Starting tokenization for SECOND batch...", flush=True)
+                    sys.stdout.flush()
+                
+                with torch.no_grad():
+                    input_ids, labels = tokenize_video(vq_model, pixel_values, args.context_length)
+                
+                if step == 1 and epoch == starting_epoch:
+                    print("[DEBUG] Tokenization COMPLETE for second batch", flush=True)
+                    sys.stdout.flush()
+                
+                if step == 0 and epoch == starting_epoch:
+                    print(f"[DEBUG] Tokenization complete. Input IDs shape: {input_ids.shape}", flush=True)
+                    print(f"[DEBUG] Input IDs range: [{input_ids.min()}, {input_ids.max()}]", flush=True)
+                    print(f"[DEBUG] Labels shape: {labels.shape}", flush=True)
+                    print("[DEBUG] Starting forward pass...", flush=True)
+                    logger.info(f"Tokenization complete. Input IDs shape: {input_ids.shape}")
+                    logger.info(f"Input IDs range: [{input_ids.min()}, {input_ids.max()}]")
+                    logger.info(f"Labels shape: {labels.shape}")
+                    logger.info("Starting forward pass...")
+                    sys.stdout.flush()
+                    sys.stderr.flush()
+                
+                # Forward pass
+                with accelerator.accumulate(model):
+                    outputs = model(input_ids=input_ids, labels=labels)
+                    loss = outputs.loss
+                    
+                    if step == 0 and epoch == starting_epoch:
+                        print(f"[DEBUG] Forward pass complete. Loss: {loss.item():.4f}", flush=True)
+                        logger.info(f"Forward pass complete. Loss: {loss.item():.4f}")
+                        sys.stdout.flush()
+                        sys.stderr.flush()
+                    
+                    if step == 1 and epoch == starting_epoch:
+                        print(f"[DEBUG] SECOND batch forward pass complete. Loss: {loss.item():.4f}", flush=True)
+                        sys.stdout.flush()
+                    
+                    total_loss += loss.detach().float()
+                    
+                    if step == 0 and epoch == starting_epoch:
+                        print("[DEBUG] Starting backward pass...", flush=True)
+                        sys.stdout.flush()
+                    
+                    if step == 1 and epoch == starting_epoch:
+                        print("[DEBUG] Starting backward pass for SECOND batch...", flush=True)
+                        sys.stdout.flush()
+                    
+                    accelerator.backward(loss)
+                    
+                    if step == 0 and epoch == starting_epoch:
+                        print("[DEBUG] Backward pass complete", flush=True)
+                        sys.stdout.flush()
+                    
+                    if step == 1 and epoch == starting_epoch:
+                        print("[DEBUG] SECOND batch backward pass complete", flush=True)
+                        sys.stdout.flush()
+                    
+                    # Clip gradients
+                    if step == 1 and epoch == starting_epoch:
+                        print(f"[DEBUG] Checking sync_gradients: {accelerator.sync_gradients}", flush=True)
+                        sys.stdout.flush()
+                    
+                    if accelerator.sync_gradients:
+                        if step == 0 and epoch == starting_epoch:
+                            print("[DEBUG] Clipping gradients...", flush=True)
+                            sys.stdout.flush()
+                        
+                        if step == 1 and epoch == starting_epoch:
+                            print("[DEBUG] Syncing gradients - clipping...", flush=True)
+                            sys.stdout.flush()
+                        
+                        accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                        
+                        if step == 0 and epoch == starting_epoch:
+                            print("[DEBUG] Gradients clipped", flush=True)
+                            sys.stdout.flush()
+                        
+                        if step == 1 and epoch == starting_epoch:
+                            print("[DEBUG] Gradients clipped", flush=True)
+                            sys.stdout.flush()
+                    else:
+                        if step == 1 and epoch == starting_epoch:
+                            print("[DEBUG] NOT syncing gradients (accumulating)", flush=True)
+                            sys.stdout.flush()
+                    
+                    if step == 0 and epoch == starting_epoch:
+                        print("[DEBUG] Running optimizer step...", flush=True)
+                        sys.stdout.flush()
+                    
+                    if step == 1 and epoch == starting_epoch:
+                        print("[DEBUG] About to call optimizer.step()...", flush=True)
+                        sys.stdout.flush()
+                    
+                    optimizer.step()
+                    
+                    if step == 0 and epoch == starting_epoch:
+                        print("[DEBUG] Optimizer step complete", flush=True)
+                        sys.stdout.flush()
+                    
+                    if step == 1 and epoch == starting_epoch:
+                        print("[DEBUG] Optimizer.step() complete", flush=True)
+                        sys.stdout.flush()
+                    
+                    if step == 1 and epoch == starting_epoch:
+                        print("[DEBUG] About to call lr_scheduler.step()...", flush=True)
+                        sys.stdout.flush()
+                    
+                    lr_scheduler.step()
+                    
+                    if step == 1 and epoch == starting_epoch:
+                        print("[DEBUG] lr_scheduler.step() complete", flush=True)
+                        sys.stdout.flush()
+                    
+                    if step == 1 and epoch == starting_epoch:
+                        print("[DEBUG] About to call optimizer.zero_grad()...", flush=True)
+                        sys.stdout.flush()
+                    
+                    optimizer.zero_grad()
+                    
+                    if step == 0 and epoch == starting_epoch:
+                        print("[DEBUG] First training step COMPLETE!", flush=True)
+                        sys.stdout.flush()
+                    
+                    if step == 1 and epoch == starting_epoch:
+                        print("[DEBUG] SECOND training step COMPLETE!", flush=True)
+                        sys.stdout.flush()
+                
+                # Explicit memory cleanup after each step
+                if step == 1 and epoch == starting_epoch:
+                    print("[DEBUG] About to delete tensors...", flush=True)
+                    sys.stdout.flush()
+                
+                del pixel_values, input_ids, labels, outputs, loss
+                
+                if step == 1 and epoch == starting_epoch:
+                    print("[DEBUG] Tensors deleted", flush=True)
+                    sys.stdout.flush()
+                
+                if step % 10 == 0:  # More aggressive cleanup every 10 steps
+                    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+                    gc.collect()
+                
+                if step == 1 and epoch == starting_epoch:
+                    print("[DEBUG] Memory cleanup complete, moving to next iteration", flush=True)
+                    sys.stdout.flush()
+                
+                if step == 2 and epoch == starting_epoch:
+                    print(f"\n[DEBUG] THIRD ITERATION - Step {step} - Training is progressing!", flush=True)
+                    sys.stdout.flush()
+                
+            except Exception as e:
+                logger.error(f"Error at step {step}: {str(e)}")
+                logger.error(f"Batch shape: {batch.shape if hasattr(batch, 'shape') else 'unknown'}")
+                raise
             
             # Update progress
             if accelerator.sync_gradients:
