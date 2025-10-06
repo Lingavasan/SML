@@ -52,6 +52,4 @@ python train_mnist_ivideogpt.py \
   --eval_steps $EVAL_STEPS \
   --dataloader_num_workers $NUM_WORKERS \
   --num_samples 2 \
-  --seed 42 \
-  --mixed_precision fp16 \
-  --generate_samples
+  --seed 42
