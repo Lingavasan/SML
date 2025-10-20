@@ -40,6 +40,15 @@ def parse_args():
     parser.add_argument('--repeat_times', default=5, type=int, help="number of times to repeat prediction")
     parser.add_argument("--seed", type=int, default=0, help="random seed")
 
+    # output options
+    parser.add_argument('--save_formats', type=str, default='gif', choices=['gif', 'mp4', 'both'],
+                        help='which formats to save: gif, mp4 or both')
+    parser.add_argument('--fps', type=int, default=4, help='frames per second for saved video')
+    parser.add_argument('--concat', type=str, default='side_by_side', choices=['side_by_side', 'none', 'top_bottom'],
+                        help='how to layout GT and prediction when saving (none = save prediction only)')
+    parser.add_argument('--save_frames', action='store_true', default=False,
+                        help='also save individual frames as PNGs')
+
     args = parser.parse_args()
     return args
 
@@ -72,16 +81,60 @@ def predict(args, tokenizer, model, input, actions=None):
     recon_output = tokenizer.detokenize(generated_tokens, args.context_length)
     recon_output = recon_output.clamp(0.0, 1.0)
 
-    # save predicted video
+    # save predicted video(s)
     save_path = args.output_path
     os.makedirs(save_path, exist_ok=True)
+
+    def _to_uint8(img_tensor):
+        return (img_tensor.permute(1, 2, 0).detach().cpu().numpy() * 255).astype(np.uint8)
+
+    def _write_gif(path, frames, fps):
+        try:
+            imageio.mimsave(path, frames, fps=fps, loop=0)
+        except Exception as e:
+            print(f"Failed to write GIF {path}: {e}")
+
+    def _write_mp4(path, frames, fps):
+        try:
+            writer = imageio.get_writer(path, fps=fps, codec='libx264')
+            for f in frames:
+                writer.append_data(f)
+            writer.close()
+        except Exception as e:
+            print(f"Failed to write MP4 {path}: {e}")
+
+    formats = ['gif'] if args.save_formats == 'gif' else (['mp4'] if args.save_formats == 'mp4' else ['gif', 'mp4'])
+
     for j in range(args.repeat_times):
-        gt_frames = [(pixel_values[0, i].permute(1, 2, 0).detach().cpu().numpy() * 255).astype(np.uint8)
-                     for i in range(pixel_values.shape[1])]
-        recon_frames = [(recon_output[j, i].permute(1, 2, 0).detach().cpu().numpy() *
-                        255).astype(np.uint8) for i in range(recon_output.shape[1])]
-        frames = [np.concatenate([gt_frames[i], recon_frames[i]], axis=1) for i in range(len(gt_frames))]
-        imageio.mimsave(f"{save_path}/pred-samples-{j}.gif", frames, fps=4, loop=0)
+        gt_frames = [_to_uint8(pixel_values[0, i]) for i in range(pixel_values.shape[1])]
+        recon_frames = [_to_uint8(recon_output[j, i]) for i in range(recon_output.shape[1])]
+
+        # build output frames according to concat mode
+        out_frames = []
+        for i in range(min(len(gt_frames), len(recon_frames))):
+            if args.concat == 'side_by_side':
+                out = np.concatenate([gt_frames[i], recon_frames[i]], axis=1)
+            elif args.concat == 'top_bottom':
+                out = np.concatenate([gt_frames[i], recon_frames[i]], axis=0)
+            else:  # 'none'
+                out = recon_frames[i]
+            out_frames.append(out)
+
+        base = os.path.join(save_path, f"pred-{j}")
+        if 'gif' in formats:
+            gif_path = base + '.gif'
+            _write_gif(gif_path, out_frames, args.fps)
+            print(f"Saved GIF: {gif_path}")
+        if 'mp4' in formats:
+            mp4_path = base + '.mp4'
+            _write_mp4(mp4_path, out_frames, args.fps)
+            print(f"Saved MP4: {mp4_path}")
+
+        if args.save_frames:
+            frame_dir = base + '_frames'
+            os.makedirs(frame_dir, exist_ok=True)
+            for i, f in enumerate(out_frames):
+                imageio.imwrite(os.path.join(frame_dir, f"frame_{i:04d}.png"), f)
 
 
 def main():

@@ -2,31 +2,62 @@ import argparse
 import json
 import sys
 import os
-import cv2
 import time
 from pathlib import Path
 import psutil
 
-import PIL
-import PIL.Image
+try:
+    import cv2
+except Exception:
+    cv2 = None
+
 import torch
 import torch.nn.functional as F
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import DistributedType, ProjectConfiguration, set_seed
 import numpy as np
-from safetensors import safe_open
 
-from PIL import Image
-from torchvision import transforms
 from tqdm import tqdm
 
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel
 from diffusers.utils import check_min_version, is_wandb_available
 
+# Import VQ model first so fallback can alias VQModel if necessary
 from ivideogpt.vq_model import CompressiveVQModel, Discriminator, LPIPS
-from ivideogpt.data import *
+
+try:
+    from ivideogpt.data import DATASET_NAMED_MIXES, SimpleRoboticDataLoaderv2, EvalDataLoader
+except Exception:
+    # Minimal fallbacks so static analysis and simple runs don't fail immediately.
+    # Full functionality requires the real `ivideogpt.data` implementation.
+    DATASET_NAMED_MIXES = {}
+
+    class SimpleRoboticDataLoaderv2(torch.utils.data.Dataset):
+        """Fallback placeholder for SimpleRoboticDataLoaderv2.
+
+        This placeholder raises at initialization to avoid accidental use.
+        Replace by installing or providing `ivideogpt.data` for full functionality.
+        """
+        def __init__(self, *args, **kwargs):
+            raise NotImplementedError("SimpleRoboticDataLoaderv2 requires ivideogpt.data module")
+
+        def __len__(self):
+            return 0
+
+        def __getitem__(self, idx):
+            raise IndexError
+
+    class EvalDataLoader(object):
+        def __init__(self, *args, **kwargs):
+            raise NotImplementedError("EvalDataLoader requires ivideogpt.data module")
+
+    # Older code references VQModel; alias to CompressiveVQModel as a best-effort fallback
+    VQModel = CompressiveVQModel
+
+from ivideogpt.vq_model import CompressiveVQModel, Discriminator, LPIPS
+
 
 
 if is_wandb_available():
@@ -288,15 +319,12 @@ def plot_img(img, postfix=''):
 
 
 def main():
-    #########################
-    # SETUP Accelerator     #
-    #########################
+
     args = parse_args()
     args.output_dir = os.path.join(args.output_dir, time.strftime(
         "%Y-%m-%d-%X", time.localtime()) + ("" if args.exp_name is None else f"-{args.exp_name}"))
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Enable TF32 on Ampere GPUs
     if args.allow_tf32:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.benchmark = True
@@ -340,9 +368,6 @@ def main():
             os.makedirs(src_path, exist_ok=True)
             os.system(f"rsync -rv --exclude-from=.gitignore . {src_path}")
 
-    #########################
-    # MODELS and OPTIMIZER  #
-    #########################
     logger.info("Loading models and optimizer")
 
     if args.model_config_name_or_path is None and args.pretrained_model_name_or_path is None:
@@ -441,14 +466,11 @@ def main():
         eps=args.adam_epsilon,
     )
 
-    ##################################
-    # DATLOADER and LR-SCHEDULER     #
-    #################################
+
     logger.info("Creating dataloaders and lr_scheduler")
 
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
 
-    # DataLoaders creation:
 
     if args.dataset_name != "robotic":
         raise NotImplementedError
