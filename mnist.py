@@ -4,6 +4,7 @@ from torch.utils.data import Dataset
 from torchvision import datasets, transforms
 from PIL import Image
 import os
+import torch.nn.functional as F
 
 
 class MovingMNIST(Dataset):
@@ -207,39 +208,45 @@ class MovingMNIST(Dataset):
     def visualize_grid(self, idx, save_path='./moving_mnist_samples', grid_cols=5):
         """
         Visualize a sequence as a grid of frames in a single image.
-        
+
         Args:
             idx: Index of sequence to visualize
             save_path: Directory to save the grid image
             grid_cols: Number of columns in the grid
         """
         os.makedirs(save_path, exist_ok=True)
-        
+
         # Generate sequence
-        sequence = self[idx].squeeze().numpy()  # Shape: (seq_len, 64, 64)
-        
+        sequence = self[idx].squeeze().numpy()  # Shape: (seq_len, 3, 64, 64) or (seq_len, 1, 64, 64)
+
         # Calculate grid dimensions
         num_frames = len(sequence)
         grid_rows = (num_frames + grid_cols - 1) // grid_cols
-        
+
         # Create grid image
-        grid_height = grid_rows * self.frame_size
-        grid_width = grid_cols * self.frame_size
-        grid = np.zeros((grid_height, grid_width), dtype=np.float32)
-        
+        if self.rgb_output:
+            grid = np.zeros((3, grid_rows * self.frame_size, grid_cols * self.frame_size), dtype=np.float32)
+        else:
+            grid = np.zeros((grid_rows * self.frame_size, grid_cols * self.frame_size), dtype=np.float32)
+
         # Place frames in grid
         for frame_idx, frame in enumerate(sequence):
             row = frame_idx // grid_cols
             col = frame_idx % grid_cols
-            y = row * self.frame_size
-            x = col * self.frame_size
-            grid[y:y+self.frame_size, x:x+self.frame_size] = frame
-        
-        # Save grid
-        img = Image.fromarray((grid * 255).astype(np.uint8), mode='L')
-        img.save(os.path.join(save_path, f'seq_{idx}_grid.png'))
-        
-        print(f"Saved grid visualization to {save_path}/seq_{idx}_grid.png")
+            y, x = row * self.frame_size, col * self.frame_size
+
+            if self.rgb_output:
+                grid[:, y:y+self.frame_size, x:x+self.frame_size] = frame  # For RGB frames
+            else:
+                grid[y:y+self.frame_size, x:x+self.frame_size] = frame[0]  # For grayscale frames
+
+        # Save grid image
+        from PIL import Image
+        grid_image = (grid * 255).astype(np.uint8)
+        if self.rgb_output:
+            grid_image = np.transpose(grid_image, (1, 2, 0))  # Convert to (H, W, C) for RGB
+        Image.fromarray(grid_image).save(os.path.join(save_path, f'seq_{idx:03d}_grid.png'))
+        print(f"Saved grid visualization to {save_path}")
 
 
 def validate_pytorch_compatibility(dataset, num_samples=5):
@@ -486,6 +493,45 @@ def test_model_integration(dataset, device='cpu'):
     print("\nDataset works seamlessly with PyTorch models.")
     
     return True
+
+
+class MNISTVideo(Dataset):
+    """
+    Wraps torchvision MNIST images into (T,C,H,W) "videos".
+    mode='static': repeat same frame T times;
+    mode='jitter': small translations creating moving-MNIST-like clips.
+    """
+    def __init__(self, root="./data", train=True, download=True,
+                 T=20, mode="static", size=64):
+        self.ds = datasets.MNIST(
+            root=root, train=train, download=download,
+            transform=transforms.Compose([
+                transforms.ToTensor(),              # (1,28,28) in [0,1]
+                transforms.Resize((size, size)),
+            ])
+        )
+        self.T = T
+        self.mode = mode
+        self.size = size
+
+    def __len__(self): return len(self.ds)
+
+    def __getitem__(self, idx):
+        x, y = self.ds[idx]     # x: (1,H,W) in [0,1]
+        if self.mode == "static":
+            vid = x.unsqueeze(0).repeat(self.T, 1, 1, 1)      # (T,1,H,W)
+        else:  # jitter
+            T, H, W = self.T, x.shape[-2], x.shape[-1]
+            vid = []
+            x_pad = F.pad(x, (4,4,4,4))  # pad 8px border to allow shifts
+            for t in range(T):
+                dx = int(torch.randint(-3, 4, (1,)))
+                dy = int(torch.randint(-3, 4, (1,)))
+                vid.append(x_pad[:, 4+dy:4+dy+H, 4+dx:4+dx+W])
+            vid = torch.stack(vid, dim=0)  # (T,1,H,W)
+        # iVideoGPT prefers 3-channel; replicate
+        vid = vid.repeat(1, 3, 1, 1)       # (T,3,H,W)
+        return {"video": vid, "label": y}
 
 
 # Example usage and testing

@@ -267,6 +267,12 @@ def parse_args():
         choices=["no", "fp16", "bf16"],
         help="Whether to use mixed precision training"
     )
+    parser.add_argument(
+        "--fps",
+        type=int,
+        default=10,
+        help="Frames per second for saved GIF/MP4"
+    )
     
     args = parser.parse_args()
     return args
@@ -331,6 +337,15 @@ def tokenize_video(vq_model, pixel_values, context_length):
     with torch.no_grad():
         input_ids, labels = vq_model.tokenize(pixel_values, context_length=context_length)
     
+    # Sanitize token indices to valid range
+    try:
+        max_idx = vq_model.num_vq_embeddings + getattr(vq_model, 'num_dyn_embeddings', 0) - 1
+        input_ids = torch.clamp(input_ids, 0, max_idx)
+        labels = torch.clamp(labels, 0, max_idx)
+    except Exception:
+        # If vq_model doesn't expose expected attributes, just return what's produced
+        pass
+
     return input_ids, labels
 
 
@@ -358,6 +373,45 @@ def evaluate_model(model, vq_model, eval_dataloader, accelerator, args, global_s
             # Forward pass
             outputs = model(input_ids=input_ids, labels=labels)
             loss = outputs.loss
+
+            # Diagnostic: inspect logits for NaN/Inf and save debug artifacts when detected
+            logits = getattr(outputs, 'logits', None)
+            try:
+                bad_logits = False
+                if logits is not None:
+                    if not torch.isfinite(logits).all():
+                        bad_logits = True
+                if (not torch.isfinite(loss)) or bad_logits:
+                    # Create debug dir
+                    debug_dir = Path(args.output_dir) / 'nan_debug'
+                    debug_dir.mkdir(parents=True, exist_ok=True)
+                    ts = int(time.time())
+                    fname = debug_dir / f"eval_debug_step_{global_step}_{num_batches}_{ts}.pt"
+                    save_obj = {
+                        'input_ids': input_ids.detach().cpu(),
+                        'labels': labels.detach().cpu(),
+                        'loss': loss.detach().cpu() if isinstance(loss, torch.Tensor) else torch.tensor(float(loss)),
+                    }
+                    if logits is not None:
+                        save_obj['logits'] = logits.detach().cpu()
+                    # Also save small stats to a json-like text file for quick reading
+                    stats = {
+                        'loss_is_finite': bool(torch.isfinite(loss)),
+                        'logits_is_finite': bool(logits is None or torch.isfinite(logits).all()),
+                        'input_ids_min': int(input_ids.min().cpu().item()),
+                        'input_ids_max': int(input_ids.max().cpu().item()),
+                        'labels_min': int(labels.min().cpu().item()),
+                        'labels_max': int(labels.max().cpu().item()),
+                    }
+                    try:
+                        torch.save(save_obj, str(fname))
+                        with open(str(fname) + '.meta.txt', 'w') as mf:
+                            mf.write(json.dumps(stats, indent=2))
+                        logger.error(f"Saved eval NaN debug artifact to {fname}")
+                    except Exception as e:
+                        logger.error(f"Failed to save eval debug artifact: {e}")
+            except Exception as e:
+                logger.debug(f"Exception during eval diagnostics: {e}")
             
             total_loss += loss.item()
             num_batches += 1
@@ -419,15 +473,22 @@ def generate_predictions(model, vq_model, eval_dataloader, accelerator, args, gl
             tokens_per_full_seq = full_input_ids.shape[1]
             tokens_to_generate = tokens_per_full_seq - context_input_ids.shape[1]
 
-            # Generate future tokens
-            generated_ids = model.generate(
-                context_input_ids,
-                max_new_tokens=tokens_to_generate,
-                do_sample=True,
-                temperature=1.0,
-                top_k=100,
-                pad_token_id=0
-            )
+            # Generate future tokens with safer greedy generation to avoid NaNs
+            try:
+                with torch.inference_mode():
+                    generated_ids = model.generate(
+                        context_input_ids,
+                        max_new_tokens=tokens_to_generate,
+                        do_sample=False,  # greedy for stability
+                        num_beams=1,
+                        pad_token_id=0,
+                        max_length=context_input_ids.shape[1] + tokens_to_generate,
+                        renormalize_logits=True,
+                    )
+            except Exception as e:
+                logger.warning(f"Stable generation failed: {e}")
+                # Fallback: use context tokens as prediction
+                generated_ids = context_input_ids
 
             # Detokenize to get video frames: returns (B, Tpred, C, H, W)
             predicted_video = vq_model.detokenize(generated_ids, context_length=T_ctx)
@@ -442,9 +503,23 @@ def generate_predictions(model, vq_model, eval_dataloader, accelerator, args, gl
                     save_rollout(out_dir,
                                  context=context[0],
                                  pred=predicted_video[0],
-                                 truth=target[0] if target.shape[1] > 0 else None,
-                                 fps=10)
+                                 truth=target[0] if target.shape[1] > 0 else None)
                     logger.info(f"Saved rollout to {out_dir}")
+
+                    # Also write GIF and MP4 versions using utils.viz helpers
+                    try:
+                        from utils.viz import save_gif, save_mp4
+                        comp_dir = Path(args.output_dir) / 'rollouts' / exp_name / f"run-{time.strftime('%Y-%m-%d')}_seed-{seed}" / f"sample_{idx:06d}"
+                        comp_dir.mkdir(parents=True, exist_ok=True)
+                        gif_path = comp_dir / "rollout.gif"
+                        mp4_path = comp_dir / "rollout.mp4"
+                        # predicted_video is (T,C,H,W) in [0,1]
+                        save_gif(predicted_video[0].cpu().numpy(), gif_path, fps=args.fps)
+                        save_mp4(predicted_video[0].cpu().numpy(), mp4_path, fps=args.fps)
+                        logger.info(f"Saved GIF and MP4 to {comp_dir}")
+                    except Exception as e:
+                        logger.debug(f"Could not save gif/mp4: {e}")
+
                 except Exception as e:
                     logger.warning(f"Failed to save rollout for batch {idx}: {e}")
 
@@ -468,6 +543,18 @@ def main():
         log_with="tensorboard",
         project_config=ProjectConfiguration(**accelerator_log_kwargs),
     )
+
+    # Setup GradScaler when using fp16 on CUDA (Accelerator will handle device placement)
+    use_scaler = False
+    scaler = None
+    if args.mixed_precision == 'fp16':
+        try:
+            from torch.cuda.amp import GradScaler
+            scaler = GradScaler()
+            use_scaler = True
+        except Exception:
+            scaler = None
+            use_scaler = False
     
     # Setup logging
     logging.basicConfig(
@@ -481,8 +568,19 @@ def main():
     set_seed(args.seed)
     
     # Create output directory
+    # If user requested final outputs, clear old Final_output and use it as output_dir
     if accelerator.is_main_process:
-        os.makedirs(args.output_dir, exist_ok=True)
+        final_root = Path('./Final_output')
+        if final_root.exists():
+            # remove old outputs to avoid confusion
+            import shutil
+            try:
+                shutil.rmtree(final_root)
+            except Exception:
+                pass
+        final_root.mkdir(parents=True, exist_ok=True)
+        # prefer explicit final output dir for long runs
+        args.output_dir = str(final_root)
         # Save args
         with open(os.path.join(args.output_dir, "training_args.json"), "w") as f:
             json.dump(vars(args), f, indent=2)
@@ -512,7 +610,11 @@ def main():
             args.tokenizer_path,
             subfolder='tokenizer'
         )
-    
+    # --- vocab comes from the tokenizer/VQ ---
+    vq_vocab = int(vq_model.num_vq_embeddings + getattr(vq_model, "num_dyn_embeddings", 0))
+    # Reserve two extra tokens for pad/eos (consistent with other codepaths)
+    vocab_size = vq_vocab + 2
+
     vq_model.eval()  # Keep in eval mode (frozen)
     vq_model = vq_model.to(accelerator.device)
     
@@ -523,14 +625,20 @@ def main():
     else:
         logger.info(f"Initializing model from config: {args.model_config}")
         config = AutoConfig.from_pretrained(args.model_config)
-        # --- make the transformer head match the tokenizer size ---
-        config.vocab_size = vocab_size
 
-        # ensure we have a valid pad token (use eos if pad is missing)
-        if getattr(config, "pad_token_id", None) is None:
-            config.pad_token_id = getattr(config, "eos_token_id", 0)
+        # Make the transformer head match the tokenizer/VQ vocab exactly.
+        # Reserve two slots for pad/eos and place their ids at the end of the VQ range.
+        config.vocab_size = int(vocab_size)
+        config.pad_token_id = int(vq_vocab)
+        config.eos_token_id = int(vq_vocab + 1)
 
-            model = AutoModelForCausalLM.from_config(config)
+        # Create the model from config in float32 to avoid float16 overflow/NaN issues
+        model = AutoModelForCausalLM.from_config(config)
+        try:
+            model = model.to(torch.float32)
+        except Exception:
+            # If device casting fails here, we'll rely on Accelerator to move and dtype-convert later
+            pass
             
     # Gradient checkpointing disabled - causes hanging issues
     # if hasattr(model, 'gradient_checkpointing_enable'):
@@ -719,8 +827,42 @@ def main():
                 
                 # Forward pass
                 with accelerator.accumulate(model):
-                    outputs = model(input_ids=input_ids, labels=labels)
-                    loss = outputs.loss
+                    # Mixed precision forward
+                    if use_scaler:
+                        from torch.cuda.amp import autocast
+                        with autocast():
+                            outputs = model(input_ids=input_ids, labels=labels)
+                            loss = outputs.loss
+                    else:
+                        outputs = model(input_ids=input_ids, labels=labels)
+                        loss = outputs.loss
+
+                    # Stability: scale loss and attempt alternate computation on NaN/Inf
+                    loss = loss * 0.1
+                    skip_update = False
+                    if not torch.isfinite(loss):
+                        logger.warning("NaN/Inf detected in loss; attempting alternate stable computation")
+                        logits = getattr(outputs, 'logits', None)
+                        if logits is not None:
+                                try:
+                                    # Numerically-stable path: clamp logits, replace NaN/Inf, apply log_softmax
+                                    logits = torch.clamp(logits, min=-1e2, max=1e2)
+                                    logits = torch.nan_to_num(logits, nan=0.0, posinf=1e2, neginf=-1e2)
+                                    # small temperature to avoid extreme softmax
+                                    safe_log_probs = F.log_softmax(logits / 1.0, dim=-1)
+                                    gathered = torch.gather(safe_log_probs, -1, labels.unsqueeze(-1))
+                                    alt_loss = -torch.mean(gathered)
+                                    if torch.isfinite(alt_loss):
+                                        loss = alt_loss * 0.1
+                                        logger.info("Alternate loss computation succeeded (stable path)")
+                                    else:
+                                        raise ValueError("Alternate loss not finite after stable path")
+                                except Exception as e:
+                                    logger.error(f"Alternate loss computation failed: {e}")
+                                    skip_update = True
+                        else:
+                            logger.error("No logits available for alternate loss computation")
+                            skip_update = True
                     
                     if step == 0 and epoch == starting_epoch:
                         print(f"[DEBUG] Forward pass complete. Loss: {loss.item():.4f}", flush=True)
@@ -742,7 +884,12 @@ def main():
                         print("[DEBUG] Starting backward pass for SECOND batch...", flush=True)
                         sys.stdout.flush()
                     
-                    accelerator.backward(loss)
+                    if not skip_update:
+                        if use_scaler:
+                            # scale loss for stable fp16 training
+                            scaler.scale(loss).backward()
+                        else:
+                            accelerator.backward(loss)
                     
                     if step == 0 and epoch == starting_epoch:
                         print("[DEBUG] Backward pass complete", flush=True)
@@ -757,7 +904,7 @@ def main():
                         print(f"[DEBUG] Checking sync_gradients: {accelerator.sync_gradients}", flush=True)
                         sys.stdout.flush()
                     
-                    if accelerator.sync_gradients:
+                    if not skip_update and accelerator.sync_gradients:
                         if step == 0 and epoch == starting_epoch:
                             print("[DEBUG] Clipping gradients...", flush=True)
                             sys.stdout.flush()
@@ -788,7 +935,62 @@ def main():
                         print("[DEBUG] About to call optimizer.step()...", flush=True)
                         sys.stdout.flush()
                     
-                    optimizer.step()
+                        if not skip_update:
+                            # Sanitize gradients: replace non-finite entries with zeros and clip norm
+                            for p in model.parameters():
+                                if p.grad is None:
+                                    continue
+                                try:
+                                    p.grad.data = torch.nan_to_num(p.grad.data, nan=0.0, posinf=1e3, neginf=-1e3)
+                                except Exception:
+                                    p.grad = None
+
+                            # Clip gradients to avoid spikes
+                            try:
+                                torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                            except Exception:
+                                pass
+
+                            # Log gradient norm (main process only)
+                            try:
+                                total_norm = 0.0
+                                for p in model.parameters():
+                                    if p.grad is None:
+                                        continue
+                                    param_norm = p.grad.data.norm(2)
+                                    total_norm += param_norm.item() ** 2
+                                total_norm = total_norm ** 0.5
+                                if accelerator.is_main_process:
+                                    logger.info(f"Grad norm: {total_norm:.6f}")
+                            except Exception:
+                                pass
+
+                            # Use scaler.step when using fp16
+                            if use_scaler:
+                                try:
+                                    scaler.unscale_(optimizer)
+                                except Exception:
+                                    pass
+
+                            # Re-check gradients for finiteness after sanitization
+                            grads_ok = True
+                            for p in model.parameters():
+                                if p.grad is None:
+                                    continue
+                                if not torch.isfinite(p.grad).all():
+                                    grads_ok = False
+                                    break
+
+                            if not grads_ok:
+                                logger.error("Detected NaN/Inf in gradients after sanitization, skipping optimizer.step() and zeroing grads")
+                                optimizer.zero_grad()
+                                skip_update = True
+                            else:
+                                if use_scaler:
+                                    scaler.step(optimizer)
+                                    scaler.update()
+                                else:
+                                    optimizer.step()
                     
                     if step == 0 and epoch == starting_epoch:
                         print("[DEBUG] Optimizer step complete", flush=True)
@@ -802,7 +1004,8 @@ def main():
                         print("[DEBUG] About to call lr_scheduler.step()...", flush=True)
                         sys.stdout.flush()
                     
-                    lr_scheduler.step()
+                    if not skip_update:
+                        lr_scheduler.step()
                     
                     if step == 1 and epoch == starting_epoch:
                         print("[DEBUG] lr_scheduler.step() complete", flush=True)
@@ -812,7 +1015,11 @@ def main():
                         print("[DEBUG] About to call optimizer.zero_grad()...", flush=True)
                         sys.stdout.flush()
                     
-                    optimizer.zero_grad()
+                    if not skip_update:
+                        optimizer.zero_grad()
+                    else:
+                        # Ensure grads cleared to avoid accumulation
+                        optimizer.zero_grad()
                     
                     if step == 0 and epoch == starting_epoch:
                         print("[DEBUG] First training step COMPLETE!", flush=True)

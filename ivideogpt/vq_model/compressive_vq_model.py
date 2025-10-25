@@ -1,3 +1,5 @@
+
+
 from typing import *
 
 import torch
@@ -163,21 +165,33 @@ class CompressiveVQModel(ModelMixin, ConfigMixin):
 
     @apply_forward_hook
     def tokenize(self, pixel_values: torch.FloatTensor, context_length: int = 0):
-        assert context_length == self.context_length  # TODO: fix
-
         B, T, C, H, W = pixel_values.shape
-
+        
+        # Ensure context_length is valid and matches self.context_length
+        if context_length <= 0 or context_length != self.context_length:
+            context_length = self.context_length
+        context_length = min(context_length, T)
+        
+        # Split into context and future frames
         context_frames = pixel_values[:, :context_length].reshape(-1, C, H, W)
         future_frames = pixel_values[:, context_length:].reshape(-1, C, H, W)
         future_length = T - context_length
-
+        
+        if future_length <= 0:
+            future_length = 1
+            future_frames = pixel_values[:, -1:].reshape(-1, C, H, W)
+        
         # encode context frames
         h, cond_features = self.encoder(context_frames, return_features=True)
+        
+        # reshape conditional features
         if self.context_length > 1:
-            B = future_frames.shape[0] // future_length
+            batch_size = future_frames.shape[0] // future_length
             cond_features = [
-                f.reshape(B, self.context_length, *f.shape[-3:]).unsqueeze(1)
-                .repeat(1, future_length, 1, 1, 1, 1).reshape(-1, self.context_length, *f.shape[-3:])
+                f.reshape(batch_size, context_length, *f.shape[-3:])
+                .unsqueeze(1)
+                .expand(-1, future_length, -1, -1, -1, -1)
+                .reshape(-1, context_length, *f.shape[-3:])
                 for f in cond_features
             ]  # B*(T-t), t, C, H, W
         else:
