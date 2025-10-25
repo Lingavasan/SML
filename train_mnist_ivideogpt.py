@@ -389,9 +389,6 @@ def generate_predictions(model, vq_model, eval_dataloader, accelerator, args, gl
     model.eval()
     vq_model.eval()
     
-    # We'll optionally save full rollouts (context, prediction, truth) from the
-    # validation loader. This iterates over val batches, generates future frames
-    # from the context, and calls `save_rollout` which writes GIF/MP4s.
     exp_name = "baseline_mnist"
     seed = int(torch.initial_seed() or 0)
     run_dir = Path(args.output_dir) / "rollouts" / exp_name / f"run-{time.strftime('%Y-%m-%d')}_seed-{seed}"
@@ -505,6 +502,9 @@ def main():
             tokenizer_path = os.path.join(tokenizer_path, 'tokenizer')
         logger.info(f"  Loading from local path: {tokenizer_path}")
         vq_model = CompressiveVQModel.from_pretrained(tokenizer_path)
+        # --- vocab comes from the tokenizer/VQ ---
+        vocab_size = vq_model.num_vq_embeddings + getattr(vq_model, "num_dyn_embeddings", 0)
+
     else:
         # HuggingFace repo - use subfolder parameter
         logger.info(f"  Loading from HuggingFace with subfolder='tokenizer'")
@@ -523,8 +523,15 @@ def main():
     else:
         logger.info(f"Initializing model from config: {args.model_config}")
         config = AutoConfig.from_pretrained(args.model_config)
-        model = AutoModelForCausalLM.from_config(config)
-    
+        # --- make the transformer head match the tokenizer size ---
+        config.vocab_size = vocab_size
+
+        # ensure we have a valid pad token (use eos if pad is missing)
+        if getattr(config, "pad_token_id", None) is None:
+            config.pad_token_id = getattr(config, "eos_token_id", 0)
+
+            model = AutoModelForCausalLM.from_config(config)
+            
     # Gradient checkpointing disabled - causes hanging issues
     # if hasattr(model, 'gradient_checkpointing_enable'):
     #     logger.info("Enabling gradient checkpointing to reduce memory usage")
