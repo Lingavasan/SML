@@ -40,6 +40,9 @@ import imageio
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import set_seed, ProjectConfiguration
+from utils.viz import save_rollout
+from pathlib import Path
+import time, torch
 
 from transformers import (
     AutoConfig,
@@ -386,59 +389,72 @@ def generate_predictions(model, vq_model, eval_dataloader, accelerator, args, gl
     model.eval()
     vq_model.eval()
     
-    # Get a batch
-    batch = next(iter(eval_dataloader))
-    pixel_values = batch[:args.num_samples].to(accelerator.device)
-    
-    batch_size, seq_len, channels, height, width = pixel_values.shape
-    
+    # We'll optionally save full rollouts (context, prediction, truth) from the
+    # validation loader. This iterates over val batches, generates future frames
+    # from the context, and calls `save_rollout` which writes GIF/MP4s.
+    exp_name = "baseline_mnist"
+    seed = int(torch.initial_seed() or 0)
+    run_dir = Path(args.output_dir) / "rollouts" / exp_name / f"run-{time.strftime('%Y-%m-%d')}_seed-{seed}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    T_ctx = args.context_length
+    save_every = 50
+    max_batch_saves = max(1, args.num_samples)  # how many batches to save at most
+    saved_batches = 0
+
     with torch.no_grad():
-        # Get the full sequence tokens for visualization
-        full_input_ids, full_labels = tokenize_video(vq_model, pixel_values, context_length=args.context_length)
-        
-        # For generation: tokenize just the context frames
-        context_frames = pixel_values[:, :args.context_length]
-        context_input_ids, _ = tokenize_video(vq_model, context_frames, context_length=args.context_length)
-        
-        # Calculate how many tokens to generate for future frames
-        # Each frame generates tokens, we need tokens for (seq_len - context_length) frames
-        tokens_per_full_seq = full_input_ids.shape[1]
-        tokens_to_generate = tokens_per_full_seq - context_input_ids.shape[1]
-        
-        # Generate future tokens
-        generated_ids = model.generate(
-            context_input_ids,
-            max_new_tokens=tokens_to_generate,
-            do_sample=True,
-            temperature=1.0,
-            top_k=100,
-            pad_token_id=0
-        )
-        
-        # Detokenize to get video frames
-        # The detokenize method expects indices without the first dummy token
-        predicted_video = vq_model.detokenize(generated_ids, context_length=args.context_length)
-    
-    # Save samples
-    sample_dir = Path(args.output_dir) / "samples" / f"step_{global_step}"
-    sample_dir.mkdir(parents=True, exist_ok=True)
-    
-    for i in range(min(args.num_samples, batch_size)):
-        # Save ground truth
-        gt_path = sample_dir / f"sample_{i}_gt.gif"
-        save_video_samples(pixel_values[i], gt_path)
-        
-        # Save prediction
-        pred_path = sample_dir / f"sample_{i}_pred.gif"
-        save_video_samples(predicted_video[i], pred_path)
-        
-        # Save context + prediction side by side
-        combined = torch.cat([pixel_values[i], predicted_video[i]], dim=-1)  # Concatenate width-wise
-        combined_path = sample_dir / f"sample_{i}_combined.gif"
-        save_video_samples(combined, combined_path)
-    
-    logger.info(f"Saved {args.num_samples} sample predictions to {sample_dir}")
-    
+        for idx, batch in enumerate(eval_dataloader):
+            # dataloader in this repo returns tensors directly: (B, T, C, H, W)
+            video = batch.to(accelerator.device)
+            B, T, C, H, W = video.shape
+
+            # Split context and target
+            context = video[:, :T_ctx]
+            target = video[:, T_ctx:]
+
+            # Tokenize full sequence to compute how many tokens to generate
+            full_input_ids, _ = tokenize_video(vq_model, video, context_length=T_ctx)
+
+            # Tokenize just the context for generation
+            context_frames = context
+            context_input_ids, _ = tokenize_video(vq_model, context_frames, context_length=T_ctx)
+
+            tokens_per_full_seq = full_input_ids.shape[1]
+            tokens_to_generate = tokens_per_full_seq - context_input_ids.shape[1]
+
+            # Generate future tokens
+            generated_ids = model.generate(
+                context_input_ids,
+                max_new_tokens=tokens_to_generate,
+                do_sample=True,
+                temperature=1.0,
+                top_k=100,
+                pad_token_id=0
+            )
+
+            # Detokenize to get video frames: returns (B, Tpred, C, H, W)
+            predicted_video = vq_model.detokenize(generated_ids, context_length=T_ctx)
+
+            # Optionally save rollouts periodically (only on main process)
+            if accelerator.is_main_process and (idx % save_every == 0):
+                out_dir = run_dir / f"sample_{idx:06d}"
+                out_dir.mkdir(parents=True, exist_ok=True)
+
+                # save_rollout expects single examples; take first item in batch
+                try:
+                    save_rollout(out_dir,
+                                 context=context[0],
+                                 pred=predicted_video[0],
+                                 truth=target[0] if target.shape[1] > 0 else None,
+                                 fps=10)
+                    logger.info(f"Saved rollout to {out_dir}")
+                except Exception as e:
+                    logger.warning(f"Failed to save rollout for batch {idx}: {e}")
+
+                saved_batches += 1
+                if saved_batches >= max_batch_saves:
+                    break
+
     model.train()
 
 
